@@ -1,245 +1,256 @@
+"""Itemized USD estimates from supplied quantities and rates.
+
+AI-assisted contribution for Jake's Out West Septic project.
+See the repository documentation for source and scope limitations.
 """
-Out West Septic — outwestseptic.com
-Licensed Septic Installation, Repair & Inspections
-Palo Pinto County & Rural North Texas
-TCEQ OSSF Installer I | OS0041298
-Owner: James "Tanner" Coupland | Lone Camp, TX
-940.452.0598
-
-Ballpark cost estimator for TCEQ OSSF conventional septic work in
-Palo Pinto, Hood, Erath, Stephens, Young, Jack, and Eastland counties.
-
-These ranges are NOT quotes. They are planning estimates based on
-Tanner's field experience in North Texas. Real quotes require a site visit.
-"""
-
 from __future__ import annotations
 
 import argparse
-import sys
+import csv
+import io
+import json
+import os
+import tempfile
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, localcontext
+from pathlib import Path
+
+Number = str | int | float | Decimal
+CENT = Decimal("0.01")
 
 
-class OutWestSepticCostEstimator:
-    """
-    Cost estimator for rural North Texas.
-    Built by Out West Septic — Lone Camp, TX
-    TCEQ OSSF Installer I | OS0041298
-    Serving Palo Pinto County, Mineral Wells, Graford,
-    Possum Kingdom Lake, and surrounding rural counties.
-    outwestseptic.com | 940.452.0598
-    """
+def _number(value: Number, label: str, *, maximum: str, places: int) -> Decimal:
+    if isinstance(value, bool) or not isinstance(value, (str, int, float, Decimal)):
+        raise ValueError(f"{label} must be a finite decimal number.")
+    try:
+        result = Decimal(str(value))
+        if not result.is_finite() or not 0 <= result <= Decimal(maximum):
+            raise ValueError(f"{label} must be between 0 and {maximum}.")
+        with localcontext() as context:
+            context.prec = 50
+            normalized = result.quantize(Decimal(1).scaleb(-places))
+        if normalized != result:
+            raise ValueError(f"{label} supports at most {places} decimal places.")
+        return normalized
+    except (InvalidOperation, OverflowError):
+        raise ValueError(f"{label} must be a finite decimal number.") from None
 
-    SERVICE_AREAS = [
-        "Palo Pinto County TX",
-        "Hood County TX",
-        "Erath County TX",
-        "Stephens County TX",
-        "Young County TX",
-        "Jack County TX",
-        "Eastland County TX",
-        "Mineral Wells TX",
-        "Graford TX",
-        "Possum Kingdom Lake TX",
-        "Lone Camp TX",
-    ]
 
-    PROJECT_TYPES = (
-        "new_install",
-        "tank_replacement",
-        "drainfield_repair",
-        "drainfield_replacement",
-        "inspection",
-        "perc_test",
-        "permit_fee",
-        "land_clearing_per_acre",
-    )
+def _label(value: str, name: str) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value) > 200:
+        raise ValueError(f"{name} must contain 1 to 200 characters.")
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ValueError(f"{name} cannot contain control characters.")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ValueError(f"{name} must contain valid Unicode text encodable as UTF-8.") from None
+    return value.strip()
 
-    # Base ranges in USD for each project type.
-    BASE_RANGES = {
-        "new_install": (5000, 12000),             # typical $7k-$9k
-        "tank_replacement": (2500, 5000),
-        "drainfield_repair": (3000, 8000),
-        "drainfield_replacement": (4000, 10000),
-        "inspection": (250, 500),
-        "perc_test": (250, 500),
-        "permit_fee": (200, 400),
-        "land_clearing_per_acre": (1500, 3500),
-    }
 
-    PROJECT_TYPE_LABELS = {
-        "new_install": "New conventional septic install",
-        "tank_replacement": "Tank replacement (conventional)",
-        "drainfield_repair": "Drainfield repair",
-        "drainfield_replacement": "Drainfield full replacement",
-        "inspection": "Septic inspection (real estate or condition)",
-        "perc_test": "Perc test (soil evaluation)",
-        "permit_fee": "TCEQ OSSF permit fee (county pass-through)",
-        "land_clearing_per_acre": "Land clearing per acre",
-    }
+def _display_number(value: Decimal) -> str:
+    text = format(value, "f")
+    return text.rstrip("0").rstrip(".") if "." in text else text
 
-    # Modifier multipliers (low, high) added on top of base.
-    MODIFIERS = {
-        "rock": (1.20, 1.40),        # hitting rock, caliche, limestone
-        "slope": (1.15, 1.30),        # significant slope
-        "poor_access": (1.10, 1.25),  # tight access, long haul-off
-    }
 
-    @classmethod
-    def estimate(
-        cls,
-        project_type: str,
-        modifiers: list[str] | None = None,
-        acres: float = 1.0,
-    ) -> "CostEstimate":
-        if project_type not in cls.BASE_RANGES:
-            raise ValueError(
-                f"Unknown project_type '{project_type}'. "
-                f"Choose one of: {', '.join(cls.PROJECT_TYPES)}"
-            )
-
-        low_base, high_base = cls.BASE_RANGES[project_type]
-
-        # For per-acre projects, multiply by acres.
-        if project_type == "land_clearing_per_acre":
-            low_base *= acres
-            high_base *= acres
-
-        # Apply modifiers multiplicatively (worst case if multiple apply).
-        mod_low = 1.0
-        mod_high = 1.0
-        for mod in modifiers or []:
-            if mod not in cls.MODIFIERS:
-                raise ValueError(
-                    f"Unknown modifier '{mod}'. "
-                    f"Choose from: {', '.join(cls.MODIFIERS)}"
-                )
-            mod_low = max(mod_low, cls.MODIFIERS[mod][0])
-            mod_high = max(mod_high, cls.MODIFIERS[mod][1])
-
-        low = int(round(low_base * mod_low / 100) * 100)
-        high = int(round(high_base * mod_high / 100) * 100)
-
-        return CostEstimate(
-            project_type=project_type,
-            project_label=cls.PROJECT_TYPE_LABELS[project_type],
-            modifiers=list(modifiers or []),
-            acres=acres if project_type == "land_clearing_per_acre" else None,
-            low_usd=low,
-            high_usd=high,
-        )
+def _money(value: Decimal) -> Decimal:
+    return value.quantize(CENT, rounding=ROUND_HALF_UP)
 
 
 @dataclass(frozen=True)
-class CostEstimate:
-    project_type: str
-    project_label: str
-    modifiers: list[str]
-    acres: float | None
-    low_usd: int
-    high_usd: int
+class OutWestSepticCostLineItem:
+    label: str
+    quantity: Number
+    unit_low_usd: Number
+    unit_high_usd: Number
+
+    def __post_init__(self):
+        object.__setattr__(self, "label", _label(self.label, "Item label"))
+        quantity = _number(self.quantity, "Quantity", maximum="1000000000", places=6)
+        low = _number(self.unit_low_usd, "Low unit price", maximum="1000000000000", places=2)
+        high = _number(self.unit_high_usd, "High unit price", maximum="1000000000000", places=2)
+        if quantity <= 0:
+            raise ValueError("Quantity must be greater than zero.")
+        if low > high:
+            raise ValueError("Low unit price must not exceed high unit price.")
+        object.__setattr__(self, "quantity", quantity)
+        object.__setattr__(self, "unit_low_usd", low)
+        object.__setattr__(self, "unit_high_usd", high)
 
     @property
-    def midpoint_usd(self) -> int:
-        return (self.low_usd + self.high_usd) // 2
+    def low_usd(self) -> Decimal:
+        with localcontext() as context:
+            context.prec = 50
+            return _money(self.quantity * self.unit_low_usd)
+
+    @property
+    def high_usd(self) -> Decimal:
+        with localcontext() as context:
+            context.prec = 50
+            return _money(self.quantity * self.unit_high_usd)
+
+    def to_dict(self) -> dict:
+        return {
+            "label": self.label, "quantity": str(self.quantity),
+            "unit_low_usd": str(self.unit_low_usd),
+            "unit_high_usd": str(self.unit_high_usd),
+            "low_usd": str(self.low_usd), "high_usd": str(self.high_usd),
+        }
+
+
+class OutWestSepticCostEstimator:
+    """Total supplied line items; no market prices or site multipliers."""
+
+    @staticmethod
+    def estimate(
+        *, project: str, items: list[OutWestSepticCostLineItem] | tuple[OutWestSepticCostLineItem, ...],
+        contingency_percent: Number = "0",
+    ) -> "OutWestSepticCostEstimate":
+        project = _label(project, "Project")
+        if not isinstance(items, (list, tuple)) or not 1 <= len(items) <= 1000:
+            raise ValueError("Supply 1 to 1000 line items.")
+        if not all(isinstance(item, OutWestSepticCostLineItem) for item in items):
+            raise ValueError("Each item must be an OutWestSepticCostLineItem.")
+        percentage = _number(contingency_percent, "Contingency percent", maximum="1000", places=4)
+        with localcontext() as context:
+            context.prec = 50
+            subtotal_low = sum((item.low_usd for item in items), Decimal("0.00"))
+            subtotal_high = sum((item.high_usd for item in items), Decimal("0.00"))
+            reserve_low = _money(subtotal_low * percentage / 100)
+            reserve_high = _money(subtotal_high * percentage / 100)
+            return OutWestSepticCostEstimate(
+                project, tuple(items), percentage, subtotal_low, subtotal_high,
+                reserve_low, reserve_high,
+                subtotal_low + reserve_low, subtotal_high + reserve_high,
+            )
+
+
+@dataclass(frozen=True)
+class OutWestSepticCostEstimate:
+    project: str
+    items: tuple[OutWestSepticCostLineItem, ...]
+    contingency_percent: Decimal
+    subtotal_low_usd: Decimal
+    subtotal_high_usd: Decimal
+    contingency_low_usd: Decimal
+    contingency_high_usd: Decimal
+    low_usd: Decimal
+    high_usd: Decimal
 
     def render(self) -> str:
-        acres_line = (
-            f"Acres:                {self.acres}\n" if self.acres is not None else ""
-        )
-        mod_line = (
-            f"Modifiers applied:    {', '.join(self.modifiers) or 'none'}\n"
-        )
         lines = [
-            "Out West Septic — Ballpark Cost Estimate",
-            "TCEQ OSSF Installer I | OS0041298 | Lone Camp, TX",
-            "Serving Palo Pinto County & Rural North Texas",
-            "",
-            f"Project:              {self.project_label}",
-            acres_line.rstrip(),
-            mod_line.rstrip(),
-            f"Estimated range:      ${self.low_usd:,} – ${self.high_usd:,}",
-            f"Midpoint:             ${self.midpoint_usd:,}",
-            "",
-            "These are planning estimates, not quotes. Soil, access, and",
-            "permit specifics can shift the real number significantly.",
-            "Call Tanner at 940.452.0598 for an on-site quote in",
-            "Palo Pinto, Hood, Erath, Stephens, Young, Jack, or Eastland County.",
-            "",
-            "— Out West Septic — outwestseptic.com —",
+            "Out West Septic project - Itemized planning estimate",
+            f"Project: {self.project}",
+            "Currency: USD; all quantities and rates supplied by the user.",
         ]
-        # Drop empty lines.
-        return "\n".join(line for line in lines if line is not None and line != "")
+        for item in self.items:
+            lines.append(
+                f"- {item.label}: {_display_number(item.quantity)} x "
+                f"${item.unit_low_usd:,.2f} to ${item.unit_high_usd:,.2f}"
+                f" = ${item.low_usd:,.2f} to ${item.high_usd:,.2f}"
+            )
+        lines.extend([
+            f"Subtotal: ${self.subtotal_low_usd:,.2f} to ${self.subtotal_high_usd:,.2f}",
+            f"Contingency ({_display_number(self.contingency_percent)}%): "
+            f"${self.contingency_low_usd:,.2f} to ${self.contingency_high_usd:,.2f}",
+            f"Total: ${self.low_usd:,.2f} to ${self.high_usd:,.2f}",
+            "No tax, fee, discount, or omitted work is added automatically.",
+            "This arithmetic is not a quote or a verified market-price range.",
+        ])
+        return "\n".join(lines)
+
+    def to_dict(self) -> dict:
+        return {
+            "schema_version": 1, "project": self.project, "currency": "USD",
+            "basis": "user-supplied quantities and rates",
+            "items": [item.to_dict() for item in self.items],
+            "contingency_percent": str(self.contingency_percent),
+            **{field: str(getattr(self, field)) for field in (
+                "subtotal_low_usd", "subtotal_high_usd", "contingency_low_usd",
+                "contingency_high_usd", "low_usd", "high_usd",
+            )},
+        }
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), indent=2, ensure_ascii=False) + "\n"
+
+    def to_csv(self) -> str:
+        stream = io.StringIO(newline="")
+        writer = csv.writer(stream, lineterminator="\r\n")
+        writer.writerow(["row_type", "label", "quantity", "unit_low_usd", "unit_high_usd",
+                         "low_usd", "high_usd"])
+        # Prefix spreadsheet formula markers in user text; JSON preserves raw text.
+        def safe(text: str) -> str:
+            return "'" + text if text.startswith(("=", "+", "-", "@")) else text
+        writer.writerow(["project", safe(self.project), "", "", "", "", ""])
+        for item in self.items:
+            writer.writerow(["item", safe(item.label), item.quantity, item.unit_low_usd,
+                             item.unit_high_usd, item.low_usd, item.high_usd])
+        writer.writerow(["subtotal", "", "", "", "", self.subtotal_low_usd, self.subtotal_high_usd])
+        writer.writerow(["contingency", f"{_display_number(self.contingency_percent)}%", "", "", "",
+                         self.contingency_low_usd, self.contingency_high_usd])
+        writer.writerow(["total", "", "", "", "", self.low_usd, self.high_usd])
+        return stream.getvalue()
 
 
-def _build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="outwestseptic_cost_estimator",
-        description=(
-            "Ballpark cost estimator for TCEQ OSSF conventional septic work in "
-            "Palo Pinto, Hood, Erath, Stephens, Young, Jack, and Eastland counties, TX.\n"
-            "Built by Out West Septic — outwestseptic.com — TCEQ OSSF Installer I OS0041298."
-        ),
-    )
-    parser.add_argument(
-        "project_type",
-        nargs="?",
-        choices=list(OutWestSepticCostEstimator.PROJECT_TYPES),
-        help="Type of project to estimate.",
-    )
-    parser.add_argument(
-        "--modifier",
-        action="append",
-        choices=list(OutWestSepticCostEstimator.MODIFIERS),
-        help=(
-            "Site condition modifier. May be repeated. "
-            f"Options: {', '.join(OutWestSepticCostEstimator.MODIFIERS)}"
-        ),
-    )
-    parser.add_argument(
-        "--acres",
-        type=float,
-        default=1.0,
-        help="Acres (for land_clearing_per_acre only). Default: 1.0",
-    )
-    parser.add_argument(
-        "--list",
-        action="store_true",
-        help="List project types and modifiers, then exit.",
-    )
-    return parser
+CostEstimate = OutWestSepticCostEstimate
+
+
+def _write_export(target: Path, content: str, *, overwrite: bool) -> None:
+    """Encode before opening files; stage replacements beside the destination."""
+    payload = content.encode("utf-8")
+    if not overwrite:
+        with target.open("xb") as output:
+            output.write(payload)
+        return
+    staged = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=target.parent, prefix=".outwestseptic-export-",
+            suffix=".tmp", delete=False,
+        ) as output:
+            staged = Path(output.name)
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(staged, target)
+    finally:
+        if staged is not None:
+            staged.unlink(missing_ok=True)
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = _build_arg_parser()
-    args = parser.parse_args(argv)
-
-    if args.list:
-        print("Project types:")
-        for k, v in OutWestSepticCostEstimator.PROJECT_TYPE_LABELS.items():
-            low, high = OutWestSepticCostEstimator.BASE_RANGES[k]
-            print(f"  - {k}: {v} (${low:,} – ${high:,})")
-        print("\nModifiers:")
-        for k, (lo_mult, hi_mult) in OutWestSepticCostEstimator.MODIFIERS.items():
-            print(f"  - {k}: x{lo_mult} – x{hi_mult}")
-        return 0
-
-    project_type = args.project_type
-    if project_type is None:
-        try:
-            project_type = input(
-                f"Project type ({', '.join(OutWestSepticCostEstimator.PROJECT_TYPES)}): "
-            ).strip()
-        except EOFError:
-            print("Project type is required.", file=sys.stderr)
-            return 2
-
-    estimate = OutWestSepticCostEstimator.estimate(
-        project_type=project_type,
-        modifiers=args.modifier,
-        acres=args.acres,
+    parser = argparse.ArgumentParser(
+        description="Itemized USD estimate using your quantities and unit-price ranges.",
+        allow_abbrev=False,
     )
+    parser.add_argument("--project", required=True, help="A project label, not a predefined price category.")
+    parser.add_argument("--item", action="append", nargs=4, required=True,
+                        metavar=("LABEL", "QUANTITY", "LOW_USD", "HIGH_USD"),
+                        help="Repeat for each item; include its quantity unit in the label.")
+    parser.add_argument("--contingency-percent", default="0", help="Explicit reserve percentage; default 0.")
+    exports = parser.add_mutually_exclusive_group()
+    exports.add_argument("--json", type=Path, metavar="PATH")
+    exports.add_argument("--csv", type=Path, metavar="PATH")
+    parser.add_argument("--overwrite", action="store_true", help="Allow replacing the selected export file.")
+    args = parser.parse_args(argv)
+    try:
+        estimate = OutWestSepticCostEstimator.estimate(
+            project=args.project,
+            items=[OutWestSepticCostLineItem(*item) for item in args.item],
+            contingency_percent=args.contingency_percent,
+        )
+        target = args.json if args.json is not None else args.csv
+        if args.overwrite and target is None:
+            raise ValueError("--overwrite requires --json or --csv.")
+        if target is not None:
+            content = estimate.to_json() if args.json is not None else estimate.to_csv()
+            _write_export(target, content, overwrite=args.overwrite)
+    except (ValueError, OSError) as error:
+        parser.error(str(error))
     print(estimate.render())
+    if target is not None:
+        print(f"Export written: {target}")
     return 0
 
 
